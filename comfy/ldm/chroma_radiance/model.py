@@ -3,12 +3,13 @@
 # Chroma Radiance adaption referenced from https://github.com/lodestone-rock/flow
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional, Union
 
 import torch
 from torch import Tensor, nn
 from einops import repeat
 import comfy.ldm.common_dit
+from comfy.utils import common_upscale
 
 from comfy.ldm.flux.layers import EmbedND
 
@@ -25,6 +26,7 @@ from .layers import (
     NerfFinalLayerConv,
 )
 
+from tqdm import tqdm
 
 @dataclass
 class ChromaRadianceParams(ChromaParams):
@@ -39,6 +41,8 @@ class ChromaRadianceParams(ChromaParams):
     nerf_final_head_type: str
     # None means use the same dtype as the model.
     nerf_embedder_dtype: Optional[torch.dtype]
+    nerf_scale: float = 1.0
+    nerf_scale_mode: Union[str, Callable[[Tensor, int, int], Tensor]] = "nearest-exact"
 
 
 class ChromaRadiance(Chroma):
@@ -178,25 +182,31 @@ class ChromaRadiance(Chroma):
         self,
         img_orig: Tensor,
         img_out: Tensor,
+        img_in_shape: torch.Size,
         params: ChromaRadianceParams,
     ) -> Tensor:
         B, C, H, W = img_orig.shape
         num_patches = img_out.shape[1]
-        patch_size = params.patch_size
+        rev_scale_h = H / img_in_shape[-2]
+        rev_scale_w = W / img_in_shape[-1]
+        patch_size_h = int(params.patch_size * rev_scale_h)
+        patch_size_w = int(params.patch_size * rev_scale_w)
+        patch_sizes = (patch_size_h, patch_size_w)
+        tqdm.write(f"RADIANCE: forward_nerf: orig shape={img_orig.shape}, in shape={img_in_shape}, out shape={img_out.shape}, num_patches={num_patches}, rev_scale_h={rev_scale_h:.4f}, rev_scale_w={rev_scale_w:.4f}, patch_size_h={patch_size_h}, patch_size_w={patch_size_w}")
 
         # Store the raw pixel values of each patch for the NeRF head later.
         # unfold creates patches: [B, C * P * P, NumPatches]
-        nerf_pixels = nn.functional.unfold(img_orig, kernel_size=patch_size, stride=patch_size)
+        nerf_pixels = nn.functional.unfold(img_orig, kernel_size=patch_sizes, stride=patch_sizes)
         nerf_pixels = nerf_pixels.transpose(1, 2) # -> [B, NumPatches, C * P * P]
 
         if params.nerf_tile_size > 0 and num_patches > params.nerf_tile_size:
             # Enable tiling if nerf_tile_size isn't 0 and we actually have more patches than
             # the tile size.
-            img_dct = self.forward_tiled_nerf(img_out, nerf_pixels, B, C, num_patches, patch_size, params)
+            img_dct = self.forward_tiled_nerf(img_out, nerf_pixels, B, C, num_patches, patch_sizes, params)
         else:
             # Reshape for per-patch processing
             nerf_hidden = img_out.reshape(B * num_patches, params.hidden_size)
-            nerf_pixels = nerf_pixels.reshape(B * num_patches, C, patch_size**2).transpose(1, 2)
+            nerf_pixels = nerf_pixels.reshape(B * num_patches, C, patch_size_h * patch_size_w).transpose(1, 2)
 
             # Get DCT-encoded pixel embeddings [pixel-dct]
             img_dct = self.nerf_image_embedder(nerf_pixels)
@@ -213,8 +223,8 @@ class ChromaRadiance(Chroma):
         img_dct = nn.functional.fold(
             img_dct,
             output_size=(H, W),
-            kernel_size=patch_size,
-            stride=patch_size,
+            kernel_size=patch_sizes,
+            stride=patch_sizes,
         )
         return self._nerf_final_layer(img_dct)
 
@@ -225,7 +235,7 @@ class ChromaRadiance(Chroma):
         batch: int,
         channels: int,
         num_patches: int,
-        patch_size: int,
+        patch_sizes: tuple[int, int],
         params: ChromaRadianceParams,
     ) -> Tensor:
         """
@@ -234,6 +244,7 @@ class ChromaRadiance(Chroma):
         nerf_pixels has shape [B, L, C * P * P]
         """
         tile_size = params.nerf_tile_size
+        patch_size_h, patch_size_w = patch_sizes
         output_tiles = []
         # Iterate over the patches in tiles. The dimension L (num_patches) is at index 1.
         for i in range(0, num_patches, tile_size):
@@ -250,7 +261,7 @@ class ChromaRadiance(Chroma):
             # [B, NumPatches_tile, D] -> [B * NumPatches_tile, D]
             nerf_hidden_tile = nerf_hidden_tile.reshape(batch * num_patches_tile, params.hidden_size)
             # [B, NumPatches_tile, C*P*P] -> [B*NumPatches_tile, C, P*P] -> [B*NumPatches_tile, P*P, C]
-            nerf_pixels_tile = nerf_pixels_tile.reshape(batch * num_patches_tile, channels, patch_size**2).transpose(1, 2)
+            nerf_pixels_tile = nerf_pixels_tile.reshape(batch * num_patches_tile, channels, patch_size_h * patch_size_w).transpose(1, 2)
 
             # get DCT-encoded pixel embeddings [pixel-dct]
             img_dct_tile = self.nerf_image_embedder(nerf_pixels_tile)
@@ -277,7 +288,9 @@ class ChromaRadiance(Chroma):
         bad_keys = tuple(
             k
             for k, v in overrides.items()
-            if type(v) != type(getattr(params, k)) and (v is not None or k not in nullable_keys)
+            if type(v) != type(getattr(params, k))
+            and (v is not None or k not in nullable_keys)
+            and (k != "nerf_scale_mode" or not hasattr(v, "__call__"))
         )
         if bad_keys:
             e = f"Invalid value(s) in transformer_options chroma_radiance_options: {', '.join(bad_keys)}"
@@ -305,9 +318,17 @@ class ChromaRadiance(Chroma):
             raise ValueError("Input txt tensors must have 3 dimensions.")
 
         params = self.radiance_get_override_params(transformer_options.get("chroma_radiance_options", {}))
+        tqdm.write(f"RADIANCE: params={params}")
 
-        h_len = (img.shape[-2] // self.patch_size)
-        w_len = (img.shape[-1] // self.patch_size)
+        if params.nerf_scale != 1:
+            scale_incr = 16
+            h_adj = max(scale_incr, int(h * params.nerf_scale / scale_incr) * scale_incr)
+            w_adj = max(scale_incr, int(w * params.nerf_scale / scale_incr) * scale_incr)
+        else:
+            h_adj = h
+            w_adj = w
+        h_len = ((h_adj + (self.patch_size // 2)) // self.patch_size)
+        w_len = ((w_adj + (self.patch_size // 2)) // self.patch_size)
 
         img_ids = torch.zeros((h_len, w_len, 3), device=x.device, dtype=x.dtype)
         img_ids[:, :, 1] = img_ids[:, :, 1] + torch.linspace(0, h_len - 1, steps=h_len, device=x.device, dtype=x.dtype).unsqueeze(1)
@@ -315,8 +336,14 @@ class ChromaRadiance(Chroma):
         img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
         txt_ids = torch.zeros((bs, context.shape[1], 3), device=x.device, dtype=x.dtype)
 
+        if h_adj != h or w_adj != w:
+            img_in = common_upscale(img, w_adj, h_adj, params.nerf_scale_mode, None) if isinstance(params.nerf_scale_mode, str) else params.nerf_scale_mode(img, w_adj, h_adj)
+        else:
+            img_in = img
+        img_in_shape = img_in.shape
+
         img_out = self.forward_orig(
-            img,
+            img_in,
             img_ids,
             context,
             txt_ids,
@@ -326,4 +353,5 @@ class ChromaRadiance(Chroma):
             transformer_options,
             attn_mask=kwargs.get("attention_mask", None),
         )
-        return self.forward_nerf(img, img_out, params)[:, :, :h, :w]
+        del img_in
+        return self.forward_nerf(img, img_out, img_in_shape, params)[:, :, :h, :w]
