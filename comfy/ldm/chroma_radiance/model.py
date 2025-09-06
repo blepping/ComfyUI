@@ -327,8 +327,11 @@ class ChromaRadiance(Chroma):
         else:
             h_adj = h
             w_adj = w
-        h_len = ((h_adj + (self.patch_size // 2)) // self.patch_size)
-        w_len = ((w_adj + (self.patch_size // 2)) // self.patch_size)
+        h_len = ((h + (self.patch_size // 2)) // self.patch_size)
+        w_len = ((w + (self.patch_size // 2)) // self.patch_size)
+        if h_adj != h or w_adj != w:
+            h_len = round(h_len * (h_adj / h))
+            w_len = round(w_len * (w_adj / w))
 
         img_ids = torch.zeros((h_len, w_len, 3), device=x.device, dtype=x.dtype)
         img_ids[:, :, 1] = img_ids[:, :, 1] + torch.linspace(0, h_len - 1, steps=h_len, device=x.device, dtype=x.dtype).unsqueeze(1)
