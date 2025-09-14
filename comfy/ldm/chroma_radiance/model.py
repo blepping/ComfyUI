@@ -2,8 +2,10 @@
 # Original Flux code can be found on: https://github.com/black-forest-labs/flux
 # Chroma Radiance adaption referenced from https://github.com/lodestone-rock/flow
 
+import math
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from functools import lru_cache
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -187,10 +189,9 @@ class ChromaRadiance(Chroma):
     ) -> Tensor:
         B, C, H, W = img_orig.shape
         num_patches = img_out.shape[1]
+        patch_size_h, patch_size_w = get_dct_scaling(*img_orig.shape[-2:], params.nerf_scale)[-2:]
         rev_scale_h = H / img_in_shape[-2]
         rev_scale_w = W / img_in_shape[-1]
-        patch_size_h = int(params.patch_size * rev_scale_h)
-        patch_size_w = int(params.patch_size * rev_scale_w)
         patch_sizes = (patch_size_h, patch_size_w)
         tqdm.write(f"RADIANCE: forward_nerf: orig shape={img_orig.shape}, in shape={img_in_shape}, out shape={img_out.shape}, num_patches={num_patches}, rev_scale_h={rev_scale_h:.4f}, rev_scale_w={rev_scale_w:.4f}, patch_size_h={patch_size_h}, patch_size_w={patch_size_w}")
 
@@ -209,7 +210,7 @@ class ChromaRadiance(Chroma):
             nerf_pixels = nerf_pixels.reshape(B * num_patches, C, patch_size_h * patch_size_w).transpose(1, 2)
 
             # Get DCT-encoded pixel embeddings [pixel-dct]
-            img_dct = self.nerf_image_embedder(nerf_pixels)
+            img_dct = self.nerf_image_embedder(nerf_pixels, *patch_sizes)
 
             # Pass through the dynamic MLP blocks (the NeRF)
             for block in self.nerf_blocks:
@@ -264,7 +265,7 @@ class ChromaRadiance(Chroma):
             nerf_pixels_tile = nerf_pixels_tile.reshape(batch * num_patches_tile, channels, patch_size_h * patch_size_w).transpose(1, 2)
 
             # get DCT-encoded pixel embeddings [pixel-dct]
-            img_dct_tile = self.nerf_image_embedder(nerf_pixels_tile)
+            img_dct_tile = self.nerf_image_embedder(nerf_pixels_tile, *patch_sizes)
 
             # pass through the dynamic MLP blocks (the NeRF)
             for block in self.nerf_blocks:
@@ -310,7 +311,8 @@ class ChromaRadiance(Chroma):
         **kwargs: dict,
     ) -> Tensor:
         bs, c, h, w = x.shape
-        img = comfy.ldm.common_dit.pad_to_patch_size(x, (self.patch_size, self.patch_size))
+        img = x
+        # img = comfy.ldm.common_dit.pad_to_patch_size(x, (self.patch_size, self.patch_size))
 
         if img.ndim != 4:
             raise ValueError("Input img tensor must be in [B, C, H, W] format.")
@@ -321,9 +323,7 @@ class ChromaRadiance(Chroma):
         tqdm.write(f"RADIANCE: params={params}")
 
         if params.nerf_scale != 1:
-            scale_incr = 16
-            h_adj = max(scale_incr, int(h * params.nerf_scale / scale_incr) * scale_incr)
-            w_adj = max(scale_incr, int(w * params.nerf_scale / scale_incr) * scale_incr)
+            h_adj, w_adj = get_dct_scaling(h, w, params.nerf_scale)[:2]
         else:
             h_adj = h
             w_adj = w
@@ -358,3 +358,96 @@ class ChromaRadiance(Chroma):
         )
         del img_in
         return self.forward_nerf(img, img_out, img_in_shape, params)[:, :, :h, :w]
+
+
+@lru_cache(maxsize=16)
+def get_divisors(n: int) -> List[int]:
+    """Returns a sorted list of all divisors of n."""
+    divs = set()
+    for i in range(1, int(n**0.5) + 1):
+        if n % i == 0:
+            divs.add(i)
+            divs.add(n // i)
+    return sorted(list(divs))
+
+
+@lru_cache(maxsize=16)
+def get_dct_scaling(
+    original_height: int,
+    original_width: int,
+    scale_factor: float,
+    original_patch_size: int = 16,
+    aspect_ratio_tolerance: float = 0.05,
+) -> Tuple[int, int, int, int]:
+    """
+    Calculates viable scaling dimensions and output patch sizes while preserving aspect ratio.
+
+    Args:
+        original_height: The height of the original image.
+        original_width: The width of the original image.
+        scale_factor: The desired scaling factor (e.g., 0.6).
+        original_patch_size: The fixed patch size of the model (e.g., 16).
+        aspect_ratio_tolerance: The allowed deviation from the original aspect ratio (e.g., 0.05 for 5%).
+
+    Returns:
+        A tuple containing:
+        - final_scaled_height (int): The image height for model input.
+        - final_scaled_width (int): The image width for model input.
+        - final_output_patch_h (int): The patch height for reconstruction.
+        - final_output_patch_w (int): The patch width for reconstruction.
+    """
+    if scale_factor == 1:
+        return original_height, original_width, original_patch_size, original_patch_size
+
+    # 1. Get all possible patch counts (divisors)
+    height_divisors = get_divisors(original_height)
+    width_divisors = get_divisors(original_width)
+
+    # 2. Filter pairs by aspect ratio
+    original_aspect_ratio = original_height / original_width
+    valid_pairs = []
+    for d_h in height_divisors:
+        for d_w in width_divisors:
+            if d_w == 0:
+                continue
+            new_aspect_ratio = d_h / d_w
+            # Check if the new aspect ratio is within the tolerance of the original
+            if (
+                abs(new_aspect_ratio - original_aspect_ratio) / original_aspect_ratio
+                <= aspect_ratio_tolerance
+            ):
+                valid_pairs.append((d_h, d_w))
+
+    if not valid_pairs:
+        raise ValueError(
+            f"Could not find any valid patch counts for {original_height}x{original_width} "
+            f"that satisfy the aspect ratio tolerance of {aspect_ratio_tolerance * 100}%. "
+            "Try increasing the tolerance."
+        )
+
+    # 3. Find the best pair from the valid list based on the target scale
+    target_patches_h = (original_height * scale_factor) / original_patch_size
+    target_patches_w = (original_width * scale_factor) / original_patch_size
+
+    best_pair = None
+    min_dist = float("inf")
+
+    for d_h, d_w in valid_pairs:
+        dist = ((d_h - target_patches_h) ** 2 + (d_w - target_patches_w) ** 2) ** 0.5
+        if dist < min_dist:
+            min_dist = dist
+            best_pair = (d_h, d_w)
+
+    # 4. Calculate final parameters from the best pair
+    num_patches_h, num_patches_w = best_pair
+    final_scaled_height = num_patches_h * original_patch_size
+    final_scaled_width = num_patches_w * original_patch_size
+    final_output_patch_h = original_height // num_patches_h
+    final_output_patch_w = original_width // num_patches_w
+
+    return (
+        final_scaled_height,
+        final_scaled_width,
+        final_output_patch_h,
+        final_output_patch_w,
+    )

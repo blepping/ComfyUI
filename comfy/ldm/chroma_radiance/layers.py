@@ -47,7 +47,7 @@ class NerfEmbedder(nn.Module):
         )
 
     @lru_cache(maxsize=4)
-    def fetch_pos(self, patch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def fetch_pos(self, patch_size_h: int, patch_size_w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
         Generates and caches 2D DCT-like positional embeddings for a given patch size.
 
@@ -64,8 +64,8 @@ class NerfEmbedder(nn.Module):
             positional embeddings.
         """
         # Create normalized 1D coordinate grids from 0 to 1.
-        pos_x = torch.linspace(0, 1, patch_size, device=device, dtype=dtype)
-        pos_y = torch.linspace(0, 1, patch_size, device=device, dtype=dtype)
+        pos_x = torch.linspace(0, 1, patch_size_w, device=device, dtype=dtype)
+        pos_y = torch.linspace(0, 1, patch_size_h, device=device, dtype=dtype)
 
         # Create a 2D meshgrid of coordinates.
         pos_y, pos_x = torch.meshgrid(pos_y, pos_x, indexing="ij")
@@ -101,7 +101,7 @@ class NerfEmbedder(nn.Module):
 
         return dct
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, patch_size_h: int, patch_size_w: int) -> torch.Tensor:
         """
         Forward pass for the embedder.
 
@@ -111,20 +111,14 @@ class NerfEmbedder(nn.Module):
         Returns:
             Tensor: The output tensor of shape (B, P^2, hidden_size_input).
         """
-        # Get the batch size, number of pixels, and number of channels.
-        B, P2, C = inputs.shape
-
-        # Infer the patch side length from the number of pixels (P^2).
-        patch_size = int(P2 ** 0.5)
-
         input_dtype = inputs.dtype
         inputs = inputs.to(dtype=self.dtype)
 
         # Fetch the pre-computed or cached positional embeddings.
-        dct = self.fetch_pos(patch_size, inputs.device, self.dtype)
+        dct = self.fetch_pos(patch_size_h, patch_size_w, inputs.device, self.dtype)
 
         # Repeat the positional embeddings for each item in the batch.
-        dct = dct.repeat(B, 1, 1)
+        dct = dct.repeat(inputs.shape[0], 1, 1)
 
         # Concatenate the original input features with the positional embeddings
         # along the feature dimension.
