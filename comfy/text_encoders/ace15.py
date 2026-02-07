@@ -2,6 +2,7 @@ from .anima import Qwen3Tokenizer
 import comfy.text_encoders.llama
 from comfy import sd1_clip
 import torch
+import logging
 import math
 from tqdm.auto import trange
 import yaml
@@ -183,7 +184,6 @@ class ACE15Tokenizer(sd1_clip.SD1Tokenizer):
             duration = float(duration.split(None, 1)[0])
         language = kwargs.get("language")
         seed = kwargs.get("seed", 0)
-        te_debug = kwargs.pop("ace15_te_debug", False)
 
         generate_audio_codes = kwargs.get("generate_audio_codes", True)
         cfg_scale = kwargs.get("cfg_scale", 2.0)
@@ -219,11 +219,6 @@ class ACE15Tokenizer(sd1_clip.SD1Tokenizer):
             "lyrics": lyrics_template.format(language if language is not None else "", lyrics),
             "qwen3_06b": qwen3_06b_template.format(text, meta_cap),
         }
-
-        if te_debug:
-            print("\n* Ace15 prompt debug:\n")
-            for pk, pv in llm_prompts.items():
-                print(f"*** {pk}\n{pv}\n")
 
         out = {
             prompt_key: self.qwen3_06b.tokenize_with_weights(prompt, prompt_key == "qwen3_06b" and return_word_ids, **kwargs)
