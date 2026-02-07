@@ -2,7 +2,6 @@ from .anima import Qwen3Tokenizer
 import comfy.text_encoders.llama
 from comfy import sd1_clip
 import torch
-import logging
 import math
 from tqdm.auto import trange
 import yaml
