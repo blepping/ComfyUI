@@ -220,7 +220,12 @@ class ACE15Tokenizer(sd1_clip.SD1Tokenizer):
         }
 
         out = {
-            prompt_key: self.qwen3_06b.tokenize_with_weights(prompt, prompt_key == "qwen3_06b" and return_word_ids, **kwargs)
+            prompt_key: self.qwen3_06b.tokenize_with_weights(
+                prompt,
+                prompt_key == "qwen3_06b" and return_word_ids,
+                disable_weights = prompt_key != "qwen3_06b",
+                **kwargs,
+            )
             for prompt_key, prompt in llm_prompts.items()
         }
         out["lm_metadata"] = {"min_tokens": min_tokens,
