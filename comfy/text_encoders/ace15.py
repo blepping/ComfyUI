@@ -145,12 +145,12 @@ class ACE15Tokenizer(sd1_clip.SD1Tokenizer):
     def _metas_to_cot(self, *, return_yaml: bool = False, **kwargs) -> str:
         user_metas = {
             k: kwargs.pop(k)
-            for k in ("bpm", "duration", "keyscale", "timesignature", "language", "caption")
+            for k in ("bpm", "duration", "keyscale", "timesignature", "language")
             if k in kwargs
         }
         timesignature = user_metas.get("timesignature")
         if isinstance(timesignature, str) and timesignature.endswith("/4"):
-            user_metas["timesignature"] = timesignature.rsplit("/", 1)[0]
+            user_metas["timesignature"] = timesignature[:-2]
         user_metas = {
             k: v if not isinstance(v, str) or not v.isdigit() else int(v)
             for k, v in user_metas.items()
@@ -163,8 +163,11 @@ class ACE15Tokenizer(sd1_clip.SD1Tokenizer):
         return f"<think>\n{meta_yaml}\n</think>" if not return_yaml else meta_yaml
 
     def _metas_to_cap(self, **kwargs) -> str:
-        use_keys = ("bpm", "duration", "keyscale", "timesignature")
+        use_keys = ("bpm", "timesignature", "keyscale", "duration")
         user_metas = { k: kwargs.pop(k, "N/A") for k in use_keys }
+        timesignature = user_metas.get("timesignature")
+        if isinstance(timesignature, str) and timesignature.endswith("/4"):
+            user_metas["timesignature"] = timesignature[:-2]
         duration = user_metas["duration"]
         if duration == "N/A":
             user_metas["duration"] = "30 seconds"
@@ -175,7 +178,8 @@ class ACE15Tokenizer(sd1_clip.SD1Tokenizer):
         return "\n".join(f"- {k}: {user_metas[k]}" for k in use_keys)
 
     def tokenize_with_weights(self, text, return_word_ids=False, **kwargs):
-        text_negative = kwargs.get("caption_negative", text)
+        text = text.strip()
+        text_negative = kwargs.get("caption_negative", text).strip()
         lyrics = kwargs.get("lyrics", "")
         lyrics_negative = kwargs.get("lyrics_negative", lyrics)
         duration = kwargs.get("duration", 120)
@@ -208,13 +212,13 @@ class ACE15Tokenizer(sd1_clip.SD1Tokenizer):
         cot_text_negative = "<think>\n</think>" if not metas_negative else self._metas_to_cot(**metas_negative)
         meta_cap = self._metas_to_cap(**kwargs)
 
-        lm_template = "<|im_start|>system\n# Instruction\nGenerate audio semantic tokens based on the given conditions:\n\n<|im_end|>\n<|im_start|>user\n# Caption\n{}\n# Lyric\n{}\n<|im_end|>\n<|im_start|>assistant\n{}\n<|im_end|>\n"
+        lm_template = "<|im_start|>system\n# Instruction\nGenerate audio semantic tokens based on the given conditions:\n\n<|im_end|>\n<|im_start|>user\n# Caption\n{}\n\n# Lyric\n{}\n<|im_end|>\n<|im_start|>assistant\n{}\n\n<|im_end|>\n"
         lyrics_template = "# Languages\n{}\n\n# Lyric\n{}<|endoftext|><|endoftext|>"
-        qwen3_06b_template = "# Instruction\nGenerate audio semantic tokens based on the given conditions:\n\n# Caption\n{}\n# Metas\n{}\n<|endoftext|>\n<|endoftext|>"
+        qwen3_06b_template = "# Instruction\nGenerate audio semantic tokens based on the given conditions:\n\n# Caption\n{}\n\n# Metas\n{}\n<|endoftext|>\n<|endoftext|>"
 
         llm_prompts = {
-            "lm_prompt": lm_template.format(text, lyrics, cot_text),
-            "lm_prompt_negative": lm_template.format(text_negative, lyrics_negative, cot_text_negative),
+            "lm_prompt": lm_template.format(text, lyrics.strip(), cot_text),
+            "lm_prompt_negative": lm_template.format(text_negative, lyrics_negative.strip(), cot_text_negative),
             "lyrics": lyrics_template.format(language if language is not None else "", lyrics),
             "qwen3_06b": qwen3_06b_template.format(text, meta_cap),
         }
@@ -223,7 +227,7 @@ class ACE15Tokenizer(sd1_clip.SD1Tokenizer):
             prompt_key: self.qwen3_06b.tokenize_with_weights(
                 prompt,
                 prompt_key == "qwen3_06b" and return_word_ids,
-                disable_weights = prompt_key != "qwen3_06b",
+                disable_weights = True,
                 **kwargs,
             )
             for prompt_key, prompt in llm_prompts.items()
