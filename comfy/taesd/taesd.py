@@ -74,7 +74,7 @@ class DecoderFlux2(Decoder):
         )
         return super().forward(x)
 
-class EncoderFlux2(Decoder):
+class EncoderFlux2(Encoder):
     def __init__(self, latent_channels: int = 128, use_gn: bool = True):
         if latent_channels != 128 or not use_gn:
             raise ValueError("Unexpected parameters for Flux2 TAE module")
