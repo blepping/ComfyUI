@@ -584,39 +584,101 @@ class SamplerDPMAdaptative(io.ComfyNode):
 
 class SamplerER_SDE(io.ComfyNode):
     @classmethod
-    def define_schema(cls):
+    def define_schema(cls) -> io.Schema:
         return io.Schema(
             node_id="SamplerER_SDE",
+            search_aliases=["sde", "er_sde", "ersde"],
             category="model/sampling/samplers",
             inputs=[
                 io.Combo.Input("solver_type", options=["ER-SDE", "Reverse-time SDE", "ODE"]),
-                io.Int.Input("max_stage", default=3, min=1, max=3, advanced=True),
-                io.Float.Input("eta", default=1.0, min=0.0, max=100.0, step=0.01, round=False, tooltip="Stochastic strength of reverse-time SDE.\nWhen eta=0, it reduces to deterministic ODE. This setting doesn't apply to ER-SDE solver type.", advanced=True),
-                io.Float.Input("s_noise", default=1.0, min=0.0, max=100.0, step=0.01, round=False, advanced=True),
+                io.Int.Input(
+                    "max_stage",
+                    default=3,
+                    min=1,
+                    max=3,
+                    advanced=True,
+                    tooltip="Controls the number of stages the sampler uses. Stages: 1 - only uses the current step (Euler). 2 - Uses history from the previous step to improve accuracy. 3 - Uses two previous steps.",
+                ),
+                io.Float.Input(
+                    "eta",
+                    default=1.0,
+                    min=0.0,
+                    max=100.0,
+                    step=0.01,
+                    advanced=True,
+                    tooltip="Stochastic strength. Only has an effect when solver_type is not ODE.",
+                ),
+                io.Float.Input(
+                    "s_noise",
+                    default=1.0,
+                    min=-100.0,
+                    max=100.0,
+                    step=0.01,
+                    advanced=True,
+                    tooltip="SDE noise multiplier. Only has an effect when solver_type is not ODE.",
+                ),
+                io.Int.Input(
+                    "integration_points",
+                    default=200,
+                    min=1,
+                    max=10000,
+                    advanced=True,
+                    tooltip="More integration points improves accuracy with diminishing returns. The default is a good compromise. Only applies to the ER-SDE solver type.",
+                ),
+                io.Float.Input(
+                    "scaling_power",
+                    default=0.3,
+                    min=0.0,
+                    max=0.7,
+                    step=0.01,
+                    advanced=True,
+                    tooltip="Controls the exponent used for ER-SDE steps. Lower values make the sampler act more like a linear solver. Values above 0.5 may cause numerical overflow. Only has an effect when ETA is non-zero.",
+                ),
+                io.Float.Input(
+                    "scaling_constant",
+                    default=10.0,
+                    min=-0.99,
+                    max=100.0,
+                    step=0.1,
+                    advanced=True,
+                    tooltip="Constant value used for ER-SDE steps. Higher values cause the sampler to transition its stable, linear mode earlier while lower values will delay the transition.",
+                ),
             ],
-            outputs=[io.Sampler.Output()]
+            outputs=[io.Sampler.Output()],
         )
 
     @classmethod
-    def execute(cls, solver_type, max_stage, eta, s_noise) -> io.NodeOutput:
-        if solver_type == "ODE" or (solver_type == "Reverse-time SDE" and eta == 0):
-            eta = 0
-            s_noise = 0
-
-        def reverse_time_sde_noise_scaler(x):
-            return x ** (eta + 1)
-
-        if solver_type == "ER-SDE":
-            # Use the default one in sample_er_sde()
-            noise_scaler = None
+    def execute(
+        cls,
+        *,
+        solver_type: str,
+        max_stage: int,
+        eta: float,
+        s_noise: float,
+        integration_points: int,
+        scaling_power: float,
+        scaling_constant: float,
+    ) -> io.NodeOutput:
+        if solver_type == "ODE":
+            eta = s_noise = 0.0
+            solver_type = "sde"
+        elif solver_type == "Reverse-time SDE":
+            solver_type = "sde"
         else:
-            noise_scaler = reverse_time_sde_noise_scaler
-
-        sampler_name = "er_sde"
-        sampler = comfy.samplers.ksampler(sampler_name, {"s_noise": s_noise, "noise_scaler": noise_scaler, "max_stage": max_stage})
+            solver_type = "ersde"
+        sampler = comfy.samplers.ksampler(
+            "er_sde",
+            {
+                "solver_type": solver_type,
+                "eta": eta,
+                "s_noise": s_noise,
+                "max_stage": max_stage,
+                "num_integration_points": integration_points,
+                "scaling_power": scaling_power,
+                "scaling_constant": scaling_constant,
+            }
+        )
         return io.NodeOutput(sampler)
-
-    get_sampler = execute
 
 
 class SamplerSASolver(io.ComfyNode):
