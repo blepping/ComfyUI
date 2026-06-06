@@ -1555,7 +1555,7 @@ def sample_er_sde(
     s_in = x.new_ones(x.shape[:1])
 
     if solver_type not in {"default", "sde", "ersde"}:
-        raise ValueError("Bad solver_type, must be one of ersde or sde")
+        raise ValueError("Bad solver_type, must be one of default, ersde or sde")
     if noise_scaler is None:
         if solver_type == "sde":
 
